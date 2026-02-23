@@ -1,0 +1,27 @@
+name: Lint
+
+on:
+  push:
+    branches:
+      - '**'
+    paths:
+      - 'rnd_template/**'
+      - 'tests/**'
+
+jobs:
+  lint:
+    name: Format and Lint Checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install poetry
+        run: pipx install poetry==1.8.2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'poetry'
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.AWS_EC2_textshuttle_dev }}
+      - run: poetry install
+      - run: poetry run ruff check --output-format=github .
