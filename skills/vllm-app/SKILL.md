@@ -1,3 +1,33 @@
+---
+name: vllm-app
+description: Create vLLM client applications that process tabular data, send prompts to a running vLLM server, collect structured JSON responses, and write enriched tables. Always generate a launch_vllm_server.sh script for server startup.
+---
+## vLLM Server Launch Script
+
+Every vllm app must include a short bash script for launching the vLLM server. Place this script in the working directory as `launch_vllm_server.sh` unless the user specifies another location or model.
+
+**Example launch script:**
+
+```bash
+CUDA_VISIBLE_DEVICES=4,5,6,7 vllm serve mistralai/Mistral-Small-3.2-24B-Instruct-2506 \
+    --tokenizer_mode mistral \
+    --config_format mistral \
+    --load_format mistral \
+    --tool-call-parser mistral \
+    --enable-auto-tool-choice \
+    --limit-mm-per-prompt '{"image":10}' \
+    --data-parallel-size 2 \
+    --gpu-memory-utilization 0.9 \
+    --max-model-len 8192 \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --tensor-parallel-size 2
+```
+
+**Documentation:**
+Add a note in the app’s README or docstring referencing the launch script and its purpose, e.g.:
+
+> "To launch the vLLM server for this app, run `bash launch_vllm_server.sh` in your working directory. Adjust CUDA_VISIBLE_DEVICES and model name as needed."
 # vLLM App Skill
 
 Create applications that send tabular data to a running vLLM server, collect structured JSON responses, and write the enriched data back to disk.
