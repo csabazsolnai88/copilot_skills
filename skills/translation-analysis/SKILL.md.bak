@@ -1,0 +1,1739 @@
+---
+name: translation-analysis
+description: Analyze machine translations using automatic metrics (BLEU, chrF, …) and/or LLM-as-a-judge evaluation via a vLLM server. Supports creating new scripts or extending existing ones. Always generates a notebook-style script (# %% cells).
+---
+
+# Copilot Skill: Translation Analysis
+
+## Overview
+This skill analyzes machine translations by:
+- Computing **automatic pairwise metrics** (BLEU, chrF, TER, …) for translation triples (source, reference, machine translation).
+- Using an **LLM as a judge** via a vLLM server to produce free-text critiques, error categories, or quality scores for machine translations.
+
+It is designed to be **extensible** — new metrics and new LLM judge tasks can be added incrementally. The agent may either **create a new script from scratch** or **extend an existing script/application** depending on the user's prompt.
+
+---
+
+## When to Use
+
+Use this skill when the user wants to:
+- Compute BLEU / chrF / TER or other automatic translation quality metrics.
+- Use an LLM to critique, score, or categorize errors in machine translations.
+- Build or extend a script/notebook that processes translation triples.
+- The user may refer to this as "translation-analysis", "translation analysis", "pairwise bleu", "llm judge", "translation review", "mt evaluation", or similar.
+
+**How to decide the mode:**
+| User mentions … | Mode |
+|---|---|
+| BLEU, chrF, TER, sacrebleu, automatic metric | **Metric mode** (no LLM needed) |
+| LLM, judge, critique, review, error categories, hallucination, vLLM, score with LLM | **LLM-as-judge mode** (needs vLLM server) |
+| Both | Combine both in the same script |
+
+---
+
+## Input Formats
+
+The skill accepts **two input modes**. Determine which one to use based on the user's prompt.
+
+### Mode A — Single Tabular File
+A CSV, XLSX, or Parquet file where each row is a translation triple. The user will specify which columns contain the source, target, and machine translation segments.
+
+### Mode B — Three Separate Files
+Three files (one per segment type: source, target, machine translation), line-aligned. Supported formats:
+- **JSONL**: each line is a JSON object; the user specifies the key that holds the text (e.g. `"text"`).
+- **Moses / plain text**: one segment per line, plain UTF-8 text.
+
+**Remote files:** If paths contain `:` (e.g. `host:/path/file.jsonl`), they are remote. The script should:
+1. Check if the file already exists locally in `--tmp-dir` / basename.
+2. If yes, use the local copy.
+3. If no, `scp` it down.
+
+---
+
+## Output Format
+
+The output is always a tabular file (CSV, XLSX, or Parquet — determined by the output path the user provides).
+
+### Metric mode output
+| src | trg | mt | bleu |
+|-----|-----|----|------|
+
+If additional metrics are computed, they appear as extra columns (e.g. `chrf`, `ter`).
+
+### LLM-as-judge mode output
+| src | trg | mt | *LLM output columns …* |
+|-----|-----|----|------------------------|
+
+The LLM output columns depend on the task: `critique`, `error_categories`, `score`, `issue_type`, etc.
+
+---
+
+## Creating vs. Extending
+
+**Check the user's prompt carefully:**
+- If they say "extend", "add to", "modify", or reference an existing script/file → **edit the existing file** to add the new capability.
+- If they say "create", "make", "new", or give no existing file → **create a new script from scratch**.
+- When extending, preserve all existing functionality and add the new feature alongside it.
+
+---
+
+## Steps Performed
+
+### For metric mode:
+
+1. **Parse the user prompt** to determine:
+   - Input mode (tabular vs. three files).
+   - File paths and column names / text keys.
+   - Desired metric(s) (default: BLEU).
+   - Output file path and format.
+
+2. **Read inputs** into three aligned lists of strings: `src_segments`, `trg_segments`, `mt_segments`.
+
+3. **Compute the requested metric(s)** for each `(trg, mt)` pair.
+
+4. **Write the results** to the output file with columns: `src`, `trg`, `mt`, and one column per metric.
+
+### For LLM-as-judge mode:
+
+1. **Parse the user prompt** to determine:
+   - Input mode (tabular vs. three files).
+   - File paths and column names / text keys.
+   - What the LLM should produce (critique, error categories, scores, etc.).
+   - vLLM server URL (default: `http://localhost:8000`).
+   - Output file path and format.
+
+2. **Read inputs** into a table with at least `src`, `trg`, `mt` columns.
+
+3. **Design the prompt** and **response schema** for the LLM task.
+
+4. **Send translation triples to the vLLM server** in batches using `VLLMClient`.
+
+5. **Join LLM responses** back to the original table.
+
+6. **Write the enriched results** to the output file.
+
+---
+
+## vLLM Server Launch Script
+
+When generating an LLM-as-judge app, also generate a `launch_vllm_server.sh` script:
+
+```bash
+CUDA_VISIBLE_DEVICES=4,5,6,7 vllm serve mistralai/Mistral-Small-3.2-24B-Instruct-2506 \
+    --tokenizer_mode mistral \
+    --config_format mistral \
+    --load_format mistral \
+    --tool-call-parser mistral \
+    --enable-auto-tool-choice \
+    --limit-mm-per-prompt '{"image":10}' \
+    --data-parallel-size 2 \
+    --gpu-memory-utilization 0.9 \
+    --max-model-len 8192 \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --tensor-parallel-size 2
+```
+
+Adjust model, GPU devices and parallelism to match the user's setup.
+
+---
+
+## VLLMClient
+
+The reusable async client is provided in `vllm_client.py` in this skill directory. **Always copy it to the same directory as the generated app script and import from there.** Do not rewrite the client.
+
+Key API:
+
+```python
+from vllm_client import VLLMClient, AppSettings
+
+config = AppSettings(
+    vllm_api_url="http://localhost:8000",  # env: TERMFORCE_VLLM_API_URL
+    vllm_api_key=None,                     # env: TERMFORCE_VLLM_API_KEY
+    batch_size=5,                          # rows per prompt
+    vllm_concurrency=8,                    # parallel requests
+    request_timeout=120,                   # seconds
+    max_retries=3,
+    retry_backoff=1.0,
+)
+
+async with VLLMClient(config) as client:
+    # Single request
+    result = await client.complete(prompt, response_schema=schema)
+
+    # Batch of prompts (concurrent)
+    results = await client.batch_complete(prompts, response_schema=schema)
+```
+
+---
+
+## Code Samples — Metric Mode
+
+### Reading a tabular file
+
+```python
+import pandas as pd
+
+def read_tabular(path: str) -> pd.DataFrame:
+    """Read a CSV, XLSX, or Parquet file into a DataFrame."""
+    if path.endswith(".csv"):
+        return pd.read_csv(path)
+    elif path.endswith(".xlsx"):
+        return pd.read_excel(path)
+    elif path.endswith(".parquet") or path.endswith(".pq"):
+        return pd.read_parquet(path)
+    else:
+        raise ValueError(f"Unsupported tabular format: {path}")
+```
+
+### Reading three separate files
+
+```python
+import json
+import logging
+
+logger = logging.getLogger(__name__)
+
+def read_jsonl(path: str, text_key: str = "text") -> list[str]:
+    """Read a JSONL file and extract text using text_key, with fallbacks.
+
+    Skips blank lines. Falls back to common key names if text_key is absent.
+    Logs a warning and appends an empty string for unparseable lines.
+    """
+    FALLBACK_KEYS = ("text", "segment", "src", "tgt", "translation")
+    texts: list[str] = []
+    with open(path, encoding="utf-8") as f:
+        for lineno, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                texts.append("")
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                logger.warning("Invalid JSON on %s:%d — skipping", path, lineno)
+                texts.append("")
+                continue
+            if text_key in obj:
+                texts.append(obj[text_key])
+            else:
+                for k in FALLBACK_KEYS:
+                    if k in obj:
+                        texts.append(obj[k])
+                        break
+                else:
+                    logger.warning("Key %r not found on %s:%d — skipping", text_key, path, lineno)
+                    texts.append("")
+    return texts
+
+def read_moses(path: str) -> list[str]:
+    """Read a plain-text Moses file (one segment per line)."""
+    with open(path, encoding="utf-8") as f:
+        return [line.strip() for line in f]
+```
+
+### Writing results
+
+```python
+import pandas as pd
+
+def write_tabular(df: pd.DataFrame, path: str) -> None:
+    """Write a DataFrame to CSV, XLSX, or Parquet based on the file extension."""
+    if path.endswith(".csv"):
+        df.to_csv(path, index=False)
+    elif path.endswith(".xlsx"):
+        df.to_excel(path, index=False)
+    elif path.endswith(".parquet") or path.endswith(".pq"):
+        df.to_parquet(path, index=False)
+    else:
+        raise ValueError(f"Unsupported output format: {path}")
+```
+
+### Computing BLEU scores
+
+```python
+import sacrebleu
+
+def bleu_score(reference: str, hypothesis: str) -> float:
+    """Compute sentence-level BLEU for a single reference/hypothesis pair."""
+    return sacrebleu.sentence_bleu(hypothesis, [reference]).score
+```
+
+### Metric registry (extensible)
+
+```python
+from collections.abc import Callable
+
+# Metric functions must have signature (reference: str, hypothesis: str) -> float | bool.
+# Boolean metrics (e.g. structural checks) are stored as 0/1 in the output table.
+METRICS: dict[str, Callable[[str, str], float | bool]] = {
+    "bleu": bleu_score,
+    # "chrf": chrf_score,
+    # "ter":  ter_score,
+    # "overgeneration":  overgeneration_score,
+    # "undergeneration": undergeneration_score,
+}
+```
+
+### Full metric pipeline
+
+```python
+from __future__ import annotations
+
+import json
+from collections.abc import Callable
+from multiprocessing import get_context
+
+import pandas as pd
+import sacrebleu
+from tqdm import tqdm
+
+
+def bleu_score(reference: str, hypothesis: str) -> float:
+    return sacrebleu.sentence_bleu(hypothesis, [reference]).score
+
+
+def overgeneration_score(reference: str, hypothesis: str) -> bool:
+    """True when the MT contains more newlines than the reference."""
+    return hypothesis.count("\n") > reference.count("\n")
+
+
+def undergeneration_score(reference: str, hypothesis: str) -> bool:
+    """True when the MT contains fewer newlines than the reference."""
+    return hypothesis.count("\n") < reference.count("\n")
+
+
+# Metric functions must have signature (reference, hypothesis) -> float | bool.
+# Boolean metrics are stored as 0/1 in the output table.
+METRICS: dict[str, Callable[[str, str], float | bool]] = {
+    "bleu": bleu_score,
+    "overgeneration": overgeneration_score,
+    "undergeneration": undergeneration_score,
+}
+
+
+# Must be a top-level function so the spawn pool can pickle it.
+def _score_row(args: tuple[str, str, str, list[str]]) -> dict:
+    src, trg, mt, metric_names = args
+    row: dict = {"src": src, "trg": trg, "mt": mt}
+    for name in metric_names:
+        row[name] = METRICS[name](trg, mt)
+    return row
+
+
+def run_metric_analysis(
+    src_segments: list[str],
+    trg_segments: list[str],
+    mt_segments: list[str],
+    output_path: str,
+    metric_names: list[str] | None = None,
+) -> pd.DataFrame:
+    if metric_names is None:
+        metric_names = ["bleu"]
+    args = [
+        (s, t, m, metric_names)
+        for s, t, m in zip(src_segments, trg_segments, mt_segments)
+    ]
+    # sacrebleu is single-threaded; use a spawned process pool to parallelise
+    # across CPU cores. `spawn` (not `fork`) is required when the parent uses
+    # any multithreaded library (e.g. Polars, numpy) to avoid mutex deadlocks.
+    with get_context("spawn").Pool() as pool:
+        records = list(
+            tqdm(
+                pool.imap(_score_row, args),
+                total=len(args),
+                desc="scoring",
+                unit="seg",
+            )
+        )
+    df = pd.DataFrame(records)
+    write_tabular(df, output_path)
+    return df
+```
+
+---
+
+## Code Samples — LLM-as-Judge Mode
+
+### Prompt design checklist
+
+Every LLM judge prompt MUST include:
+- [ ] Role sentence ("You are a …")
+- [ ] Task context (domain, what the data represents)
+- [ ] Clear instructions on what to produce
+- [ ] "Do NOT" list (at least 2 items)
+- [ ] One concrete example (input → expected JSON)
+- [ ] Numbered input rows with `src`, `trg`, `mt` fields
+- [ ] Explicit "Return only JSON" instruction at the end
+- [ ] Mention the exact schema keys the response must contain
+
+### Response schema design
+
+Rules:
+- **Always use flat data structures.** Top-level object contains a single array key `"results"`.
+- Each element has `row_id` (integer) + output columns with scalar values.
+- **No nested lists or dicts inside a record.**
+
+```python
+def get_response_schema() -> dict:
+    """JSON schema for guided generation — adapt keys to the task."""
+    return {
+        "type": "object",
+        "properties": {
+            "results": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "row_id": {"type": "integer"},
+                        # Adapt these to the task:
+                        "critique": {"type": "string"},
+                        # "score": {"type": "number", "minimum": 0, "maximum": 100},
+                        # "error_categories": {"type": "string"},
+                    },
+                    "required": ["row_id", "critique"],
+                },
+            }
+        },
+        "required": ["results"],
+    }
+```
+
+### Batching and processing loop
+
+```python
+import asyncio
+import logging
+import polars as pl
+
+logger = logging.getLogger(__name__)
+
+
+def create_batches(df: pl.DataFrame, batch_size: int) -> list[list[dict]]:
+    """Slice the DataFrame lazily so only one batch is materialised at a time."""
+    return [df.slice(i, batch_size).to_dicts() for i in range(0, len(df), batch_size)]
+
+
+async def process_table(
+    df: pl.DataFrame,
+    client,              # VLLMClient instance
+    batch_size: int,
+    concurrency: int,    # passed to AppSettings; the client semaphore enforces it
+    build_prompt_fn,     # callable(rows) -> str
+    schema: dict,
+    output_key: str = "results",
+) -> list[dict]:
+    if "row_id" not in df.columns:
+        df = df.with_row_index("row_id")
+    batches = create_batches(df, batch_size)
+    prompts = [build_prompt_fn(batch) for batch in batches]
+    logger.info("Submitting %d batches to vLLM (max %d concurrent)", len(prompts), concurrency)
+    # Submit everything at once; VLLMClient's internal semaphore caps live requests,
+    # so slower batches do not block faster ones (no group-wait straggler problem).
+    # tqdm.asyncio.tqdm.gather wraps asyncio.gather with a live progress bar.
+    from tqdm.asyncio import tqdm as tqdm_asyncio
+    responses = await tqdm_asyncio.gather(
+        *[client.complete(p, response_schema=schema) for p in prompts],
+        return_exceptions=True,
+        desc="LLM batches",
+        unit="batch",
+    )
+    all_results: list[dict] = []
+    for response in responses:
+        if isinstance(response, Exception):
+            logger.error("Batch failed: %s", response)
+            continue
+        try:
+            all_results.extend(response.get(output_key, []))
+        except Exception as e:
+            logger.error("Failed to parse response: %s", e)
+    if len(all_results) != len(df):
+        logger.warning(
+            "Coverage mismatch: expected %d result rows, got %d",
+            len(df),
+            len(all_results),
+        )
+    return all_results
+```
+
+### Example: Translation critique prompt
+
+```python
+def build_critique_prompt(rows: list[dict]) -> str:
+    """Build prompt asking LLM to critique machine translations."""
+    prompt = (
+        "You are a professional translation quality reviewer.\n"
+        "For each numbered entry, compare the machine translation (MT) against "
+        "the reference translation (REF) and write a brief critique of the MT.\n\n"
+        "Focus on: accuracy, fluency, terminology, omissions, additions.\n\n"
+        "Do NOT:\n"
+        "- Invent issues that do not exist\n"
+        "- Comment on the reference translation quality\n"
+        "- Return anything other than JSON\n\n"
+        "Example:\n"
+        "Input:\n"
+        '1. SRC: "The policyholder must pay the premium."\n'
+        '   REF: "Le preneur d\'assurance doit payer la prime."\n'
+        '   MT:  "L\'assureur doit payer la prime."\n\n'
+        "Expected output:\n"
+        '{"results": [{"row_id": 1, "critique": "Mistranslation: '
+        "'policyholder' was incorrectly translated as 'assureur' (insurer) "
+        "instead of 'preneur d'assurance'.\"}]}\n\n"
+        "Now review the following entries:\n\n"
+    )
+    for row in rows:
+        rid = row["row_id"]
+        prompt += (
+            f'{rid}. SRC: "{row["src"]}"\n'
+            f'   REF: "{row["trg"]}"\n'
+            f'   MT:  "{row["mt"]}"\n\n'
+        )
+    prompt += (
+        "Return ONLY a JSON object with a 'results' array. "
+        "Each element must have 'row_id' (integer) and 'critique' (string). "
+        "If no issues, set critique to 'No issues found'. "
+        "No markdown, no explanation.\n"
+    )
+    return prompt
+```
+
+### Example: Error categorization prompt
+
+```python
+def build_error_categorization_prompt(rows: list[dict]) -> str:
+    """Build prompt asking LLM to categorize MT errors."""
+    prompt = (
+        "You are a machine translation error analyst.\n"
+        "For each entry, classify the errors in the machine translation.\n\n"
+        "Error categories:\n"
+        "- hallucination: MT contains information not in the source\n"
+        "- deletion: MT omits information present in the source\n"
+        "- mistranslation: a word or phrase is translated incorrectly\n"
+        "- grammar: grammatical error in the MT\n"
+        "- terminology: wrong domain-specific term used\n"
+        "- style: unnatural phrasing (but meaning is correct)\n"
+        "- none: no errors found\n\n"
+        "Do NOT:\n"
+        "- Assign categories that do not apply\n"
+        "- Return anything other than JSON\n\n"
+        "Example:\n"
+        "Input:\n"
+        '1. SRC: "The premium is due on the first of each month."\n'
+        '   REF: "Die Prämie ist am Ersten jedes Monats fällig."\n'
+        '   MT:  "Die Prämie ist fällig."\n\n'
+        "Expected output:\n"
+        '{"results": [{"row_id": 1, "error_categories": "deletion", '
+        '"explanation": "MT omits the due date information."}]}\n\n'
+        "Now analyze the following entries:\n\n"
+    )
+    for row in rows:
+        rid = row["row_id"]
+        prompt += (
+            f'{rid}. SRC: "{row["src"]}"\n'
+            f'   REF: "{row["trg"]}"\n'
+            f'   MT:  "{row["mt"]}"\n\n'
+        )
+    prompt += (
+        "Return ONLY a JSON object with a 'results' array. "
+        "Each element must have 'row_id' (integer), "
+        "'error_categories' (comma-separated string of categories), "
+        "and 'explanation' (string). "
+        "No markdown, no explanation outside the JSON.\n"
+    )
+    return prompt
+```
+
+### Example: LLM scoring prompt
+
+```python
+def build_scoring_prompt(rows: list[dict]) -> str:
+    """Build prompt asking LLM to score MT quality 0-100."""
+    prompt = (
+        "You are a translation quality scorer.\n"
+        "For each entry, assign a quality score from 0 to 100 for the MT.\n"
+        "100 = perfect translation, 0 = completely wrong.\n\n"
+        "Scoring guidelines:\n"
+        "- 90-100: No errors, natural and accurate\n"
+        "- 70-89: Minor issues (style, punctuation) but meaning preserved\n"
+        "- 40-69: Some meaning errors or significant fluency issues\n"
+        "- 0-39: Major errors, hallucinations, or mostly wrong\n\n"
+        "Do NOT:\n"
+        "- Give the same score to every entry\n"
+        "- Return anything other than JSON\n\n"
+        "Example:\n"
+        "Input:\n"
+        '1. SRC: "Please sign the contract."\n'
+        '   REF: "Bitte unterschreiben Sie den Vertrag."\n'
+        '   MT:  "Bitte unterschreiben Sie den Vertrag."\n\n'
+        "Expected output:\n"
+        '{"results": [{"row_id": 1, "score": 100, "justification": '
+        '"Perfect translation."}]}\n\n'
+        "Now score the following entries:\n\n"
+    )
+    for row in rows:
+        rid = row["row_id"]
+        prompt += (
+            f'{rid}. SRC: "{row["src"]}"\n'
+            f'   REF: "{row["trg"]}"\n'
+            f'   MT:  "{row["mt"]}"\n\n'
+        )
+    prompt += (
+        "Return ONLY a JSON object with a 'results' array. "
+        "Each element must have 'row_id' (integer), 'score' (integer 0-100), "
+        "and 'justification' (string). "
+        "No markdown, no explanation.\n"
+    )
+    return prompt
+```
+
+### Full LLM-as-judge app skeleton
+
+```python
+# %% Imports
+import asyncio
+import logging
+from pathlib import Path
+
+import polars as pl
+from tqdm.asyncio import tqdm
+from vllm_client import VLLMClient, AppSettings
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# %% Prompt and schema (adapt to the specific task)
+
+def build_prompt(rows: list[dict]) -> str:
+    # Use one of the prompt templates above or design a custom one
+    ...
+
+def get_response_schema() -> dict:
+    # Match the prompt's expected output
+    ...
+
+# %% I/O helpers
+
+def load_input(path: Path) -> pl.DataFrame:
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        return pl.read_csv(path)
+    elif suffix in (".parquet", ".pq"):
+        return pl.read_parquet(path)
+    elif suffix in (".xlsx", ".xls"):
+        return pl.read_excel(path)
+    else:
+        raise ValueError(f"Unsupported: {suffix}")
+
+def save_output(df: pl.DataFrame, path: Path) -> None:
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        df.write_csv(path)
+    elif suffix in (".parquet", ".pq"):
+        df.write_parquet(path)
+    elif suffix in (".xlsx", ".xls"):
+        df.write_excel(path)
+    else:
+        raise ValueError(f"Unsupported: {suffix}")
+
+def create_batches(df: pl.DataFrame, batch_size: int) -> list[list[dict]]:
+    """Slice the DataFrame lazily so only one batch is materialised at a time."""
+    return [df.slice(i, batch_size).to_dicts() for i in range(0, len(df), batch_size)]
+
+# %% Processing
+
+async def process_table(df, client, batch_size, concurrency, build_prompt_fn, schema):
+    if "row_id" not in df.columns:
+        df = df.with_row_index("row_id")
+    batches = create_batches(df, batch_size)
+    prompts = [build_prompt_fn(batch) for batch in batches]
+    # Submit all at once; the client semaphore caps concurrency — no group-wait stragglers.
+    # tqdm.asyncio.tqdm.gather provides a live progress bar without adding straggler latency.
+    from tqdm.asyncio import tqdm as tqdm_asyncio
+    responses = await tqdm_asyncio.gather(
+        *[client.complete(p, response_schema=schema) for p in prompts],
+        return_exceptions=True,
+        desc="LLM batches",
+        unit="batch",
+    )
+    all_results = []
+    for response in responses:
+        if isinstance(response, Exception):
+            logger.error(f"Batch failed: {response}")
+            continue
+        try:
+            all_results.extend(response.get("results", []))
+        except Exception as e:
+            logger.error(f"Failed to parse: {e}")
+    if len(all_results) != len(df):
+        logger.warning(f"Coverage mismatch: expected {len(df)} rows, got {len(all_results)}")
+    return all_results
+
+# %% Main
+
+async def run_app(
+    input_path: Path,
+    output_path: Path,
+    vllm_url: str = "http://localhost:8000",
+    batch_size: int = 5,
+    concurrency: int = 8,
+) -> None:
+    config = AppSettings(
+        vllm_api_url=vllm_url,
+        batch_size=batch_size,
+        vllm_concurrency=concurrency,
+    )
+    df = load_input(input_path)
+    if "row_id" not in df.columns:
+        df = df.with_row_index("row_id")
+    schema = get_response_schema()
+    async with VLLMClient(config) as client:
+        results = await process_table(
+            df, client, batch_size, concurrency, build_prompt, schema
+        )
+    if results:
+        results_df = pl.DataFrame(results)
+        if len(results_df) != len(df):
+            logger.warning(
+                "Coverage mismatch after LLM: %d input rows but %d results — "
+                "missing rows will have null LLM columns after the join",
+                len(df), len(results_df),
+            )
+        df = df.join(results_df, on="row_id", how="left")
+    else:
+        logger.warning("No results returned from LLM")
+    if "row_id" in df.columns:
+        df = df.drop("row_id")
+    save_output(df, output_path)
+    logger.info(f"Saved {output_path}")
+
+if __name__ == "__main__":
+    import sys
+    asyncio.run(run_app(Path(sys.argv[1]), Path(sys.argv[2])))
+```
+
+---
+
+## Example Prompts & Implementations
+
+### Example 1 — Three JSONL files, BLEU scores
+
+**User prompt:**
+> I have 3 jsonl files for source, target and machine translation segments.
+> The files are under paths `src.jsonl`, `trg.jsonl`, `mt.jsonl`.
+> The text for each can be accessed with the "text" key.
+> I want to use the translation-analysis skill to get the pairwise BLEU scores
+> for each translation and save the results under `output.csv`.
+
+**Implementation the agent should produce:**
+
+```python
+import json
+import pandas as pd
+import sacrebleu
+
+def read_jsonl(path: str, text_key: str = "text") -> list[str]:
+    with open(path, encoding="utf-8") as f:
+        return [json.loads(line)[text_key] for line in f]
+
+src = read_jsonl("src.jsonl", "text")
+trg = read_jsonl("trg.jsonl", "text")
+mt = read_jsonl("mt.jsonl", "text")
+
+records = []
+for s, t, m in zip(src, trg, mt):
+    score = sacrebleu.sentence_bleu(m, [t]).score
+    records.append({"src": s, "trg": t, "mt": m, "bleu": score})
+
+df = pd.DataFrame(records)
+df.to_csv("output.csv", index=False)
+print(f"Wrote {len(df)} rows to output.csv")
+```
+
+### Example 2 — Single CSV file, BLEU
+
+**User prompt:**
+> I have a CSV file at `translations.csv` with columns `source`, `reference`, `mt_output`.
+> Compute BLEU for each row and save results to `results.parquet`.
+
+```python
+import pandas as pd
+import sacrebleu
+
+df = pd.read_csv("translations.csv")
+df["bleu"] = [
+    sacrebleu.sentence_bleu(mt, [ref]).score
+    for ref, mt in zip(df["reference"], df["mt_output"])
+]
+df = df.rename(columns={"source": "src", "reference": "trg", "mt_output": "mt"})
+df[["src", "trg", "mt", "bleu"]].to_parquet("results.parquet", index=False)
+print(f"Wrote {len(df)} rows to results.parquet")
+```
+
+### Example 3 — LLM critique of translations
+
+**User prompt:**
+> I have a CSV at `mt_output.csv` with columns `src`, `trg`, `mt`.
+> Use the translation-analysis skill with the LLM judge to write a critique of
+> each machine translation. Save the results to `critiques.csv`.
+> The vLLM server is running on http://localhost:8000.
+
+**What the agent should produce:** A notebook-style script using the full LLM-as-judge skeleton above with `build_critique_prompt`, copying `vllm_client.py` alongside it, and a `launch_vllm_server.sh`.
+
+### Example 4 — LLM error categorization
+
+**User prompt:**
+> I already have a script at `notebooks/mt_analysis.py` that computes BLEU.
+> Extend it to also categorize errors using an LLM. Error categories should be:
+> hallucination, deletion, mistranslation, grammar, terminology.
+> Add columns `error_categories` and `explanation` to the output.
+
+**What the agent should do:** Open `notebooks/mt_analysis.py`, add the LLM dependencies, the `build_error_categorization_prompt` function, the response schema, the async processing loop, and wire it into the existing pipeline. Preserve all existing metric functionality.
+
+### Example 5 — LLM scoring
+
+**User prompt:**
+> Score the machine translations in `data.parquet` (columns: `src`, `trg`, `mt`)
+> from 0 to 100 using an LLM. Output to `scored.csv`.
+
+**What the agent should produce:** A notebook-style script using `build_scoring_prompt` with the `score` + `justification` schema.
+
+---
+
+## Dependencies
+
+### Metric mode
+```bash
+pip install sacrebleu pandas openpyxl
+```
+
+### LLM-as-judge mode
+```bash
+pip install aiohttp pydantic-settings polars tqdm
+```
+
+---
+
+## Extending with New Metrics
+
+Metric functions must have signature `(reference: str, hypothesis: str) -> float | bool`.
+Boolean metrics are stored as `0`/`1` in the output table.
+Register the function in the `METRICS` dict to make it available via `--metrics`.
+
+### Example: chrF (float metric)
+
+```python
+def chrf_score(reference: str, hypothesis: str) -> float:
+    return sacrebleu.sentence_chrf(hypothesis, [reference]).score
+
+METRICS["chrf"] = chrf_score
+```
+
+### Example: structural newline checks (boolean metrics)
+
+Overgeneration and undergeneration detect segments where the MT has a different
+number of newlines than the reference — a common signal that the model generated
+extra content or dropped output blocks.
+
+```python
+def overgeneration_score(reference: str, hypothesis: str) -> bool:
+    """True when the MT contains more newlines than the reference."""
+    return hypothesis.count("\n") > reference.count("\n")
+
+
+def undergeneration_score(reference: str, hypothesis: str) -> bool:
+    """True when the MT contains fewer newlines than the reference."""
+    return hypothesis.count("\n") < reference.count("\n")
+
+
+METRICS["overgeneration"] = overgeneration_score
+METRICS["undergeneration"] = undergeneration_score
+```
+
+To run all metrics at once:
+
+```python
+df = run_metric_analysis(
+    src_segments, trg_segments, mt_segments,
+    output_path="results.csv",
+    metric_names=["bleu", "overgeneration", "undergeneration"],
+)
+# overgeneration / undergeneration columns contain 0 or 1 (bool stored as int)
+print(df[["bleu", "overgeneration", "undergeneration"]].describe())
+```
+ 
+### Aggregating segment-level scores to dataset-level metrics
+
+When evaluating a model you often want a single score or small set of
+statistics for the whole dataset (corpus BLEU, average neural metric, % of
+overgeneration). The skill supports both segment-wise and corpus-level
+aggregation. Examples below show common patterns.
+
+1) Corpus BLEU (recommended when you want a corpus-level BLEU rather than
+     the mean of sentence BLEUs):
+
+```python
+import sacrebleu
+
+# hypotheses: list[str] (mt), references: list[str] (trg)
+corpus = sacrebleu.corpus_bleu(hypotheses, [references])
+print('Corpus BLEU:', corpus.score)
+```
+
+2) Average of a per-segment metric (e.g. MetricX or sentence-level BLEU):
+
+```python
+# df is the per-segment table with column 'metricx' or 'bleu'
+mean_metric = df['metricx'].mean()
+print('Mean metricX:', mean_metric)
+```
+
+3) Percentage for boolean structural checks (over/undergeneration):
+
+```python
+# columns are 0/1 booleans stored as integers
+pct_over = df['overgeneration'].mean() * 100.0
+pct_under = df['undergeneration'].mean() * 100.0
+print(f"Overgeneration: {pct_over:.2f}%  Undergeneration: {pct_under:.2f}%")
+```
+
+Notes:
+- Prefer `sacrebleu.corpus_bleu` or `BLEU.corpus_score` when reporting a
+    single BLEU for the corpus — averaging sentence-level BLEU values is
+    informative but not equivalent to corpus BLEU.
+- For neural metrics (MetricX, COMET) report the mean (or median) and also
+    a small set of robust statistics (std, 10/90 percentiles) for stability.
+- When combining metrics into a single dashboard, normalize ranges (e.g.
+    scale MetricX to 0-100 or swap as shown in the MetricX example) so values
+    are directly comparable.
+
+### Example: MetricX (neural reference-based and QE metric)
+
+[MetricX](https://github.com/google-research/metricx) is a neural MT quality metric from Google based on mT5.
+It outputs a score in **[0, 25]** where **lower raw scores = higher quality**.
+The example below swaps the scale so that **higher scores = better**, consistent with BLEU/chrF.
+
+Two model variants exist on HuggingFace:
+- `google/metricx-24-hybrid-xxl-v2p6-bfloat16` — **reference-based** (needs `trg`).
+- `google/metricx-24-hybrid-xxl-v2p6-bfloat16-qe` — **quality estimation / reference-free** (needs only `src` and `mt`).
+
+```python
+# pip install transformers datasets torch
+from __future__ import annotations
+
+import torch
+import transformers
+from datasets import Dataset
+from pathlib import Path
+from transformers import AutoTokenizer, DataCollatorWithPadding
+
+import pandas as pd
+
+
+# ---------------------------------------------------------------------------
+# Minimal copy of the MT5ForRegression head (from google-research/metricx).
+# If you have fiumicino available, import from there instead:
+#   from fiumicino.automated.evaluation.model_metricx import MT5ForRegression, get_dataset
+# ---------------------------------------------------------------------------
+from fiumicino.automated.evaluation.model_metricx import MT5ForRegression, get_dataset
+
+
+def _build_metricx_dataset(
+    src_segments: list[str],
+    trg_segments: list[str],
+    mt_segments: list[str],
+    tokenizer,
+    device: int | str,
+    is_qe: bool,
+    max_input_length: int = 1024,
+):
+    """Tokenise triples for MetricX inference."""
+    data = [
+        {"source": s, "hypothesis": m, "reference": t}
+        for s, t, m in zip(src_segments, trg_segments, mt_segments)
+    ]
+    return get_dataset(data, tokenizer, max_input_length, device, is_qe)
+
+
+def _split_at_newlines(
+    src_segments: list[str],
+    trg_segments: list[str],
+    mt_segments: list[str],
+    is_qe: bool,
+) -> tuple[list[str], list[str], list[str]]:
+    """Split multi-line segments at newline boundaries before neural scoring.
+
+    Neural metrics have a max-token limit (~1 024 tokens).  Paragraphs separated
+    by newlines are a reliable alignment boundary, so we split them into separate
+    rows.  When the number of newlines differs between hypothesis and
+    reference/source (i.e. an overgeneration or undergeneration case), we fall
+    back to collapsing newlines to spaces to avoid index mismatches.
+    """
+    out_src, out_trg, out_mt = [], [], []
+    for s, t, m in zip(src_segments, trg_segments, mt_segments):
+        s_parts = s.split("\n")
+        t_parts = t.split("\n")
+        m_parts = m.split("\n")
+        aligned = len(m_parts) == len(s_parts) and (is_qe or len(m_parts) == len(t_parts))
+        if aligned:
+            out_src.extend(s_parts)
+            out_trg.extend(t_parts)
+            out_mt.extend(m_parts)
+        else:
+            out_src.append(s.replace("\n", " "))
+            out_trg.append(t.replace("\n", " "))
+            out_mt.append(m.replace("\n", " "))
+    return out_src, out_trg, out_mt
+
+
+def run_metricx(
+    src_segments: list[str],
+    trg_segments: list[str],
+    mt_segments: list[str],
+    output_path: str,
+    model_name: str = "google/metricx-24-hybrid-xxl-v2p6-bfloat16",
+    tokenizer_name: str = "google/mt5-xl",
+    batch_size: int = 8,
+    device: int | str = 0,
+    swap_scale: bool = True,
+) -> pd.DataFrame:
+    """Score translation triples with MetricX and write results to output_path.
+
+    Args:
+        src_segments: Source segments.
+        trg_segments: Reference translations (ignored when using a QE model).
+        mt_segments:  Machine translations to score.
+        output_path:  Destination CSV/Parquet/XLSX path.
+        model_name:   HuggingFace model id.  Append ``-qe`` for reference-free mode.
+        tokenizer_name: HuggingFace tokenizer id (default: ``google/mt5-xl``).
+        batch_size:   Per-device eval batch size.
+        device:       GPU index (int) or ``"cpu"``.
+        swap_scale:   If True (default), negate raw scores so higher = better,
+                      matching the convention used by BLEU / chrF.
+
+    Returns:
+        DataFrame with columns ``src``, ``trg``, ``mt``, ``metricx``.
+    """
+    is_qe = model_name.endswith("-qe")
+
+    # Split multi-line segments at newline boundaries before tokenisation.
+    src_split, trg_split, mt_split = _split_at_newlines(
+        src_segments, trg_segments, mt_segments, is_qe
+    )
+
+    model = MT5ForRegression.from_pretrained(model_name, torch_dtype="auto")
+    model.to(device)
+    model.eval()
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_name, cleanup_tokenization_spaces=False
+    )
+
+    data_collator, ds = _build_metricx_dataset(
+        src_split, trg_split, mt_split, tokenizer, device, is_qe
+    )
+
+    training_args = transformers.TrainingArguments(
+        output_dir="dummy_metricx",
+        per_device_eval_batch_size=batch_size,
+        dataloader_pin_memory=False,
+    )
+    trainer = transformers.Trainer(
+        model=model, args=training_args, data_collator=data_collator
+    )
+    predictions, _, _ = trainer.predict(test_dataset=ds)
+
+    # Raw MetricX scores: 0 = perfect, 25 = worst.
+    # Swap so that higher = better (consistent with BLEU/chrF).
+    scores = [-float(p) if swap_scale else float(p) for p in predictions]
+
+    df = pd.DataFrame({
+        "src": src_segments,
+        "trg": trg_segments,
+        "mt": mt_segments,
+        "metricx": scores,
+    })
+    write_tabular(df, output_path)
+    return df
+```
+
+**Usage example:**
+
+```python
+df = run_metricx(
+    src_segments, trg_segments, mt_segments,
+    output_path="results.csv",
+    model_name="google/metricx-24-hybrid-xxl-v2p6-bfloat16",
+    device=0,          # GPU index; use "cpu" for CPU-only
+    swap_scale=True,   # higher score = better quality
+)
+print(df["metricx"].describe())
+
+# Reference-free (QE) mode — no reference translation required:
+df_qe = run_metricx(
+    src_segments, [""] * len(src_segments), mt_segments,
+    output_path="results_qe.csv",
+    model_name="google/metricx-24-hybrid-xxl-v2p6-bfloat16-qe",
+)
+```
+
+**Key notes:**
+- Raw MetricX scores are in `[0, 25]` with 0 = perfect. `swap_scale=True` negates them so the column behaves like BLEU (larger = better).
+- Segments with mismatched newline counts between MT and reference are collapsed to single lines before scoring to avoid alignment errors.
+- QE variant (`-qe` suffix) needs only `src` and `mt`; pass empty strings for `trg`.
+- For large files, free GPU memory between runs: `del model; torch.cuda.empty_cache()`.
+
+## Extending with New LLM Judge Tasks
+
+1. Write a new `build_*_prompt(rows)` function following the prompt checklist.
+2. Write a matching `get_*_response_schema()`.
+
+---
+
+## MQM Prompt Library
+
+Reusable, annotated prompt templates and checker code for specific MQM error types live in a separate file
+so they stay maintainable without bloating this document.
+
+| File | Covers |
+|------|--------|
+| [`prompts_mqm.md`](prompts_mqm.md) | **Terminology / Inconsistent with terminology resource** — (1) termbase-driven checker (preferred, deterministic, no LLM needed); (2) LLM-based fallback with annotated positive/negative examples from a banking TM and the full Python builder + JSON schema |
+
+**How to use:**
+
+1. **If a termbase is available** (a CSV with `src_term` / `trg_term` columns), use the `load_termbase` + `check_segment` functions from the *Approach 1* section of `prompts_mqm.md`. Pass `--termbase <path>` to the script. MQM columns are only written when this argument is provided.
+
+2. **If no termbase is available**, fall back to the LLM prompt approach documented in *Approach 2* of `prompts_mqm.md`. Import `build_mqm_wrong_term_prompt` and `get_mqm_wrong_term_schema` and pass to `VLLMClient.batch_complete`.
+
+**Never write MQM columns when neither a termbase nor an LLM is configured** — an empty `mqm_wrong_terms` column is misleading.
+
+---
+
+## MQM Heuristic Quality Checks
+
+Five additional MQM error types can be detected without an LLM — purely via heuristics and embeddings. Each check writes two columns: a boolean flag (`mqm_{aspect}`) for counting and a details/score column for diagnostics. All checks run unconditionally (no `--termbase` or LLM required) and use the established skip-if-exists pattern.
+
+| MQM path | Column prefix | Method | LLM required? |
+|---|---|---|---|
+| Linguistic conventions / Duplication | `mqm_duplication` | Regex: consecutive repeated words, repeated n-gram spans, repeated sentences | No |
+| Accuracy / Mistranslation / Entity | `mqm_entity` | Regex + set comparison: numbers, identifiers, proper nouns | No |
+| Accuracy / Mistranslation / MT hallucination | `mqm_hallucination` | Cross-lingual cosine similarity (LaBSE) between src ↔ mt | No (embeddings only) |
+| Accuracy / Addition | `mqm_addition` | Length ratio mt/ref; flag when ratio > threshold | No |
+| Accuracy / Omission | `mqm_omission` | Length ratio mt/ref; flag when ratio < threshold | No |
+
+**Output columns per check:**
+
+| Check | Flag column | Details column | Notes |
+|---|---|---|---|
+| Duplication | `mqm_duplication` (bool) | `mqm_duplication_details` (JSON list of strings) | Each string describes one duplication instance |
+| Entity | `mqm_entity` (bool) | `mqm_entity_details` (JSON list of strings) | Describes missing/extra numbers, identifiers, proper nouns |
+| Hallucination | `mqm_hallucination` (bool) | `mqm_hallucination_score` (float 0–1) | Cosine similarity; lower = more hallucinated |
+| Addition | `mqm_addition` (bool) | `mqm_mt_ref_length_ratio` (float) | Shared ratio column with Omission |
+| Omission | `mqm_omission` (bool) | `mqm_mt_ref_length_ratio` (float) | Shared ratio column with Addition |
+
+**Cross-flagging is expected.** A hallucinated segment may also be flagged for addition (different content = longer) and entity (entities don't match). A severely truncated segment may flag both omission and entity. When counting error frequencies, filter with exclusions if needed (e.g. `addition AND NOT hallucination AND NOT duplication`).
+
+---
+
+### Duplication (Linguistic conventions / Duplication)
+
+Detects unintentional repetitions in the MT output. Three levels:
+1. **Consecutive duplicate words** — "the the", "is is" (regex `\b(\w{2,})\s+\1\b`)
+2. **Repeated multi-word spans** — 3–6 word n-gram appearing twice consecutively
+3. **Repeated sentences** — identical sentence text appearing back-to-back
+
+```python
+import re
+
+_DUP_WORD_RE = re.compile(r"\b(\w{2,})\s+\1\b", re.IGNORECASE)
+_SENT_SPLIT_RE = re.compile(r"(?<=[.!?;])\s+")
+
+
+def detect_duplication(text: str) -> tuple[bool, list[str]]:
+    """Detect duplicated content in *text*.
+
+    Returns:
+        (flag, details) where flag is True when at least one duplication
+        is found and details is a list of human-readable descriptions.
+    """
+    details: list[str] = []
+
+    # 1. Consecutive duplicate words
+    for m in _DUP_WORD_RE.finditer(text):
+        details.append(f'repeated word: "{m.group(1)}"')
+
+    # 2. Repeated multi-word spans (3–6 word n-grams)
+    words = text.split()
+    for n in range(3, min(7, len(words) // 2 + 1)):
+        seen: dict[str, int] = {}
+        for i in range(len(words) - n + 1):
+            gram = " ".join(words[i : i + n]).lower()
+            if gram in seen and seen[gram] == i - n:
+                details.append(f'repeated phrase ({n} words): "{gram}"')
+            seen[gram] = i
+
+    # 3. Repeated sentences
+    sentences = [s.strip() for s in _SENT_SPLIT_RE.split(text) if s.strip()]
+    if len(sentences) >= 2:
+        prev = sentences[0].lower()
+        for s in sentences[1:]:
+            cur = s.lower()
+            if cur == prev and len(cur) > 10:
+                details.append(f'repeated sentence: "{s[:80]}"')
+            prev = cur
+
+    # Deduplicate detail messages
+    seen_details: list[str] = []
+    for d in details:
+        if d not in seen_details:
+            seen_details.append(d)
+    return len(seen_details) > 0, seen_details
+```
+
+---
+
+### Entity (Accuracy / Mistranslation / Entity)
+
+Compares "transferable" entities between source/reference and MT:
+
+1. **Numbers** — extracted by regex, normalised (thousand separators, decimal points), compared as sets between src ↔ mt.
+2. **Identifiers** — account numbers and codes like "4567-8901" compared between src ↔ mt.
+3. **Proper nouns** — capitalised non-sentence-initial words compared between ref ↔ mt (same language, directly comparable). Uses word-boundary matching to avoid false positives from sentence restructuring.
+
+```python
+_NUMBER_RE = re.compile(r"\b\d[\d',.\u2019]*\d\b|\b\d+\b")
+_IDENT_RE = re.compile(r"\b[\dA-Za-z][\dA-Za-z]*[-/][\dA-Za-z-/]+\b")
+
+def detect_entity_error(src: str, ref: str, mt: str) -> tuple[bool, list[str]]:
+    """Detect entity mismatches between source/reference and MT.
+
+    Returns (flag, details).
+    """
+    # Compare numbers: src vs mt (numbers should be preserved across languages)
+    # Compare identifiers: src vs mt
+    # Compare proper nouns: ref vs mt (same target language, word-boundary match)
+    ...
+```
+
+Key design decisions:
+- Numbers are compared src↔mt because numbers should transfer across languages.
+- Proper nouns are compared ref↔mt (same language) to avoid cross-lingual matching issues.
+- Word-boundary matching (`re.search(r"\b" + re.escape(word) + r"\b", text)`) avoids false positives when sentence structure changes.
+
+---
+
+### MT Hallucination (Accuracy / Mistranslation / MT hallucination)
+
+Uses **LaBSE** cross-lingual sentence embeddings to compute cosine similarity between the source segment and its MT. When similarity falls below a threshold, the translation is flagged as "completely decoupled from the sense of the input sentence."
+
+```python
+_HALLUCINATION_THRESHOLD = 0.2
+
+def detect_hallucination(
+    srcs: list[str], mts: list[str],
+    threshold: float = _HALLUCINATION_THRESHOLD,
+    embed_model: str = "sentence-transformers/LaBSE",
+) -> tuple[list[bool], list[float]]:
+    """Detect MT hallucinations via cross-lingual embedding similarity.
+
+    Returns (flags, scores) — flag is True when cosine similarity < threshold.
+    """
+    from sentence_transformers import SentenceTransformer
+    import numpy as np
+
+    model = SentenceTransformer(embed_model)
+    src_emb = model.encode(srcs, convert_to_numpy=True)
+    mt_emb = model.encode(mts, convert_to_numpy=True)
+
+    dot = np.sum(src_emb * mt_emb, axis=1)
+    norm_src = np.linalg.norm(src_emb, axis=1)
+    norm_mt = np.linalg.norm(mt_emb, axis=1)
+    cos_sim = dot / (norm_src * norm_mt + 1e-9)
+
+    flags = [bool(s < threshold) for s in cos_sim]
+    scores = [round(float(s), 4) for s in cos_sim]
+    return flags, scores
+```
+
+**Threshold tuning (observed on DE→EN banking/automotive TM):**
+- True hallucinations: cosine similarity 0.08–0.12
+- Severe omissions: 0.25–0.30
+- Free translations / paraphrases: 0.60–0.80
+- Correct translations: 0.75–0.99
+
+Default threshold **0.2** catches only genuine hallucinations. Raise to 0.35 to also catch borderline cases.
+
+---
+
+### Addition & Omission (Accuracy / Addition, Accuracy / Omission)
+
+Compares character-length ratio `len(mt) / len(ref)` against thresholds:
+- **Addition**: ratio > 1.5 (MT is 50%+ longer than reference)
+- **Omission**: ratio < 0.5 (MT is less than half the reference length)
+
+```python
+_ADDITION_RATIO = 1.5
+_OMISSION_RATIO = 0.5
+
+def detect_addition_omission(
+    refs: list[str], mts: list[str],
+    addition_ratio: float = _ADDITION_RATIO,
+    omission_ratio: float = _OMISSION_RATIO,
+) -> tuple[list[bool], list[bool], list[float]]:
+    """Detect content addition and omission by length ratio.
+
+    Returns (addition_flags, omission_flags, ratios).
+    """
+    add_flags, omi_flags, ratios = [], [], []
+    for ref, mt in zip(refs, mts):
+        ref_len = max(len(ref.strip()), 1)
+        mt_len = max(len(mt.strip()), 1)
+        ratio = mt_len / ref_len
+        ratios.append(round(ratio, 3))
+        add_flags.append(ratio > addition_ratio)
+        omi_flags.append(ratio < omission_ratio)
+    return add_flags, omi_flags, ratios
+```
+
+**Why length-based?** Addition and omission by definition change the amount of content. This heuristic is language-agnostic, needs no embeddings or LLM, and runs instantly. Genuine additions typically have ratios 3–6× while genuine omissions have ratios 0.2–0.4×. Hallucinations and duplications can trigger secondary addition flags (see cross-flagging note above).
+
+---
+
+## Topic modeling (examples)
+
+Topic modeling helps group segments by domain and surface topic-specific MT issues. The workflow mirrors other analyses: (1) discover topics on a representative corpus, (2) assign per-segment topics and append columns to the output table. Always add **three columns** per topic model: `{prefix}_topic_id`, `{prefix}_topic_score`, `{prefix}_topic_terms`.
+
+Two complementary approaches are provided below. Both are tuned for **short TM segments** in a specialised domain (e.g. banking/insurance, automotive) and support **multiple languages** (tested on English, German, French, and Italian). Adapt the stop-word sets and parameters for other domains.
+
+---
+
+### Shared helpers (place near the top of the script)
+
+```python
+import re
+from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
+
+# Regex that removes common TM placeholders ({1}, &1, #124, #AUX) and bare numbers
+# before feeding text to a bag-of-words model.
+_PLACEHOLDER_RE = re.compile(r"\{[^}]*\}|&\w+|#[\w-]+|\b\d+\b")
+
+# ---------------------------------------------------------------------------
+# Extra stop words — English
+# ---------------------------------------------------------------------------
+
+# Words that leak into topic labels but carry no topic signal in banking TM.
+_EXTRA_STOPS_EN: frozenset[str] = frozenset({
+    "please", "note", "via", "using", "used", "use",
+    "carried", "does", "set", "given", "trigger", "opened", "open",
+    "aux",
+    "greater", "less", "pending", "required", "minimum", "maximum",
+    "linked", "means", "following", "date", "end",
+    "number", "type", "new",
+    # "valid" generates same-word bigrams ("valid valid") on short TM segments
+    "valid",
+})
+
+# Lighter English stop list for BERTopic: c-TF-IDF handles cross-topic
+# discrimination; keep cluster-discriminative terms like "valid", "date".
+_BERTOPIC_EXTRA_STOPS_EN: frozenset[str] = frozenset({
+    "please", "note", "via", "using", "used", "use",
+    "carried", "does", "set", "given", "trigger", "opened", "open",
+    "aux", "linked", "means", "number", "type", "new",
+})
+
+# ---------------------------------------------------------------------------
+# Extra stop words — German
+# ---------------------------------------------------------------------------
+
+# German words that slip through spacy's stop-word list in banking TM segments.
+_EXTRA_STOPS_DE: frozenset[str] = frozenset({
+    "bitte", "hinweis", "aux", "gilt", "sofern", "erfolgt",
+    "gemäss", "gemäß", "entsprechend", "folgende", "folgenden",
+    "neu", "neue", "neuen", "typ",
+})
+
+# Lighter German stop list for BERTopic (keep "gültig", "datum" etc.).
+_BERTOPIC_EXTRA_STOPS_DE: frozenset[str] = frozenset({
+    "bitte", "hinweis", "aux", "sofern",
+    "gemäss", "gemäß", "entsprechend", "folgende", "folgenden",
+})
+
+# ---------------------------------------------------------------------------
+# Extra stop words — French
+# ---------------------------------------------------------------------------
+
+# French words that slip through spacy's stop-word list in automotive TM segments.
+_EXTRA_STOPS_FR: frozenset[str] = frozenset({
+    "veuillez", "merci", "svp", "via", "aux", "puis",
+    "nouveau", "nouvelle", "nouveaux", "nouvelles",
+    "type", "voir", "selon", "suite",
+    # generic time / discourse words
+    "temps", "dernière", "dernier", "janvier", "février", "mars",
+    "également", "été", "fait", "fois", "cas", "bien", "très",
+    "agit", "permet", "ainsi", "encore", "lors", "toujours",
+    "donc", "part", "aussi", "déjà", "car", "grâce",
+})
+
+_BERTOPIC_EXTRA_STOPS_FR: frozenset[str] = frozenset({
+    "veuillez", "merci", "svp", "via", "aux", "puis",
+    "voir", "selon",
+    "temps", "dernière", "dernier", "également", "été",
+    "fait", "fois", "cas", "bien", "très",
+    "agit", "permet", "ainsi", "encore", "lors", "toujours",
+    "donc", "part", "aussi", "déjà", "car", "grâce",
+})
+
+# ---------------------------------------------------------------------------
+# Extra stop words — Italian
+# ---------------------------------------------------------------------------
+
+# Italian words that slip through spacy's stop-word list in automotive TM segments.
+_EXTRA_STOPS_IT: frozenset[str] = frozenset({
+    "prego", "cortesemente", "gentilmente", "tramite", "aux",
+    "nuovo", "nuova", "nuovi", "nuove",
+    "tipo", "vedere", "secondo", "seguito",
+    "vuole", "gennaio", "febbraio", "marzo",
+    "possibile", "seguenti", "propria", "proprio",
+    "completamente", "numerosi", "ancora", "sempre",
+    "ogni", "inoltre", "quindi", "già", "solo",
+    "fatto", "stata", "stato", "modo", "volta",
+})
+
+_BERTOPIC_EXTRA_STOPS_IT: frozenset[str] = frozenset({
+    "prego", "cortesemente", "gentilmente", "tramite", "aux",
+    "vedere", "secondo",
+    "vuole", "possibile", "seguenti", "propria", "proprio",
+    "completamente", "numerosi", "ancora", "sempre",
+    "ogni", "inoltre", "quindi", "già", "solo",
+    "fatto", "stata", "stato", "modo", "volta",
+})
+
+# ---------------------------------------------------------------------------
+# Stop-word config & helper
+# ---------------------------------------------------------------------------
+
+# Mapping: lang code → (spacy_model, nltk_name, extra_full, extra_bt)
+_STOP_WORD_CONFIG: dict[str, tuple[str, str, frozenset, frozenset]] = {
+    "de": ("de_core_news_sm", "german",  _EXTRA_STOPS_DE, _BERTOPIC_EXTRA_STOPS_DE),
+    "fr": ("fr_core_news_sm", "french",  _EXTRA_STOPS_FR, _BERTOPIC_EXTRA_STOPS_FR),
+    "it": ("it_core_news_sm", "italian", _EXTRA_STOPS_IT, _BERTOPIC_EXTRA_STOPS_IT),
+}
+
+def _get_stop_words(lang: str, for_bertopic: bool = False) -> list[str]:
+    """Return a merged stop-word list for the given language.
+
+    For English: uses sklearn's ENGLISH_STOP_WORDS.
+    For German/French/Italian: uses spacy's stop-word list (covers modal/
+    auxiliary verbs that NLTK misses) plus domain extras.  Requires spacy
+    and the corresponding model; falls back to NLTK if spacy is unavailable.
+
+    Supported spacy models:
+      - de: de_core_news_sm (543 words)
+      - fr: fr_core_news_sm (507 words)
+      - it: it_core_news_sm (624 words)
+
+    Args:
+        lang:         ISO 639-1 code ("en", "de", "fr", "it").
+        for_bertopic: If True, use the lighter stop list (BERTopic's c-TF-IDF
+                      handles discrimination; only remove generic UI noise).
+
+    Returns:
+        Unique stop words as a plain ``list`` (required by sklearn CountVectorizer).
+    """
+    cfg = _STOP_WORD_CONFIG.get(lang)
+    if cfg is not None:
+        spacy_model, nltk_name, extra_full, extra_bt = cfg
+        try:
+            import spacy
+            nlp = spacy.load(spacy_model)
+            base: set[str] = {w.lower() for w in nlp.Defaults.stop_words}
+        except Exception:
+            from nltk.corpus import stopwords as _nltk
+            base = set(_nltk.words(nltk_name))
+        extra = extra_bt if for_bertopic else extra_full
+    else:  # default: English
+        base = set(ENGLISH_STOP_WORDS)
+        extra = _BERTOPIC_EXTRA_STOPS_EN if for_bertopic else _EXTRA_STOPS_EN
+    return list(base | extra)
+
+
+def _clean_for_lda(text: str, lang: str = "en") -> str:
+    """Strip TM placeholders and normalise text before vectorisation.
+
+    For English removes all non-ASCII letters.
+    For German and other languages preserves Unicode word characters so that
+    umlauts (ä, ö, ü) and ß survive cleaning.
+
+    Args:
+        text: Raw segment text.
+        lang: ISO 639-1 language code.
+    """
+    text = _PLACEHOLDER_RE.sub(" ", text)
+    if lang == "en":
+        text = re.sub(r"[^a-zA-Z\s]", " ", text)
+    else:
+        # Keep Unicode letters; remove digits and punctuation
+        text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
+        text = re.sub(r"\d+", " ", text)
+    return re.sub(r"\s+", " ", text).strip().lower()
+```
+
+---
+
+### Example A — LDA (bag-of-words, interpretable, good for ≥ 100 docs)
+
+LDA with bigrams and a language-aware stop-word list. Works well when you need
+fast, explainable topics without GPU/embedding dependencies.
+
+Key tuning knobs:
+- **`n_topics`** — start at 5–8 for a domain-specific TM; increase until topics look distinct.
+- **`doc_topic_prior` (α)** — low value (0.1) forces each document into fewer topics, producing sharper assignments.
+- **`topic_word_prior` (β)** — low value (0.01) forces each topic to concentrate on fewer words, giving cleaner labels.
+
+```python
+import numpy as np
+from sklearn.decomposition import LatentDirichletAllocation
+from sklearn.feature_extraction.text import CountVectorizer
+
+
+def run_lda(
+    docs: list[str],
+    n_topics: int = 6,
+    n_top_terms: int = 8,
+    lang: str = "en",
+) -> tuple[list[int], list[float], list[str], dict[int, str]]:
+    """Fit LDA on *docs* and return per-document topic assignments.
+
+    Args:
+        docs:        Raw text documents (one per TM segment).
+        n_topics:    Number of topics (K).
+        n_top_terms: Number of top terms to include in each topic label.
+        lang:        ISO 639-1 code of the document language ("en", "de", …).
+                     Controls stop-word list and tokenisation pattern.
+
+    Returns:
+        (topic_ids, topic_scores, topic_terms_per_doc, topic_label_map)
+        where topic_label_map maps topic int → comma-separated term string.
+    """
+    cleaned = [_clean_for_lda(d, lang=lang) for d in docs]
+    stop_words = _get_stop_words(lang, for_bertopic=False)
+
+    # CountVectorizer settings tuned for short domain-specific TM segments.
+    # token_pattern uses Unicode \w so German umlauts are tokenised correctly.
+    vectorizer = CountVectorizer(
+        ngram_range=(1, 2),
+        min_df=2,          # require term in ≥ 2 docs (removes hapaxes)
+        max_df=0.85,       # ignore terms in > 85 % of docs (near-constant words)
+        stop_words=stop_words,
+        token_pattern=r"(?u)\b[^\W\d_]{3,}\b",  # min 3-char Unicode letters
+        max_features=300,
+    )
+    X = vectorizer.fit_transform(cleaned)
+
+    # Remove same-word bigrams ("valid valid", "gültig gültig") that appear on
+    # very short or repetitive segments and add noise to topic representations.
+    feature_names: list[str] = vectorizer.get_feature_names_out().tolist()
+    keep_mask = np.array(
+        [len(f.split()) < 2 or f.split()[0] != f.split()[1] for f in feature_names]
+    )
+    X = X[:, keep_mask]
+    feature_names = [f for f, keep in zip(feature_names, keep_mask) if keep]
+
+    lda = LatentDirichletAllocation(
+        n_components=n_topics,
+        max_iter=50,
+        random_state=42,
+        n_jobs=-1,             # parallelise E-step across all cores
+        doc_topic_prior=0.1,   # low α → sharper per-doc topic assignments
+        topic_word_prior=0.01, # low β → sharper per-topic word distributions
+    )
+    theta = lda.fit_transform(X)  # shape (n_docs, n_topics)
+
+    topic_label_map: dict[int, str] = {}
+    for k in range(n_topics):
+        top_idx = lda.components_[k].argsort()[-(n_top_terms):][::-1]
+        topic_label_map[k] = ", ".join(feature_names[i] for i in top_idx)
+
+    topic_ids    = [int(row.argmax())  for row in theta]
+    topic_scores = [float(row.max())   for row in theta]
+    topic_terms  = [topic_label_map[t] for t in topic_ids]
+
+    return topic_ids, topic_scores, topic_terms, topic_label_map
+
+
+# --- usage ---
+# EN:  topic_ids, topic_scores, topic_terms, _ = run_lda(docs, n_topics=6, lang="en")
+# DE:  topic_ids, topic_scores, topic_terms, _ = run_lda(docs, n_topics=6, lang="de")
+# FR:  topic_ids, topic_scores, topic_terms, _ = run_lda(docs, n_topics=6, lang="fr")
+# IT:  topic_ids, topic_scores, topic_terms, _ = run_lda(docs, n_topics=6, lang="it")
+```
+
+---
+
+### Example B — BERTopic (embedding + clustering; good for short / multilingual segments)
+
+BERTopic uses sentence embeddings + UMAP + HDBSCAN. Better than LDA for short,
+noisy segments because semantic similarity is captured in the embedding space.
+
+Key tuning knobs:
+- **`min_cluster_size`** — HDBSCAN parameter. Lower → more topics, fewer outliers.
+  For < 200 docs, try 3–6. Segments assigned to no cluster get topic id `-1` (outliers).
+- **`n_neighbors` (UMAP)** — local neighbourhood size. Smaller values preserve local
+  structure; sensible range 5–15 for < 200 docs.
+- **`vectorizer_model`** — pass a `CountVectorizer` with your domain stop words so
+  BERTopic's c-TF-IDF term labels are clean. Use `min_df=1` to include rare but
+  cluster-specific terms (unlike LDA, c-TF-IDF handles discrimination via IDF).
+- **`language` parameter** — **must** be `"multilingual"` for non-English text. When
+  `language="english"` BERTopic internally strips `[^A-Za-z0-9 ]` via
+  `_preprocess_text`, which destroys German umlauts (ä→dropped, ö→dropped, etc.).
+
+Embedding model selection:
+- English → `sentence-transformers/all-MiniLM-L6-v2` (fast, 384-dim)
+- All other languages → `sentence-transformers/LaBSE` (109 languages, 768-dim,
+  cached at `/scratch/csaba/HF_model_cache` on this server)
+
+```python
+from bertopic import BERTopic
+from hdbscan import HDBSCAN
+from sentence_transformers import SentenceTransformer
+from sklearn.feature_extraction.text import CountVectorizer
+from umap import UMAP
+
+# Auto-select embedding model by language
+_DEFAULT_BERTOPIC_MODEL: dict[str, str] = {
+    "en": "sentence-transformers/all-MiniLM-L6-v2",
+    "default": "sentence-transformers/LaBSE",  # 109 languages
+}
+
+
+def run_bertopic(
+    docs: list[str],
+    n_top_terms: int = 8,
+    min_cluster_size: int = 4,
+    embed_model: str | None = None,
+    lang: str = "en",
+) -> tuple[list[int], list[float], list[str], dict[int, str]]:
+    """Fit BERTopic on *docs* and return per-document topic assignments.
+
+    For small corpora (< 200 docs) UMAP and HDBSCAN parameters are tuned
+    to produce smaller, tighter clusters instead of lumping everything into
+    the outlier bucket (-1).
+
+    IMPORTANT: pass ``lang`` correctly. BERTopic applies ASCII-only preprocessing
+    when ``language="english"``, which destroys non-ASCII characters (umlauts,
+    accents, etc.). For non-English input use any other language string.
+
+    Args:
+        docs:             Raw text documents.
+        n_top_terms:      Number of top terms per topic label.
+        min_cluster_size: HDBSCAN minimum cluster size. Lower = more clusters,
+                          fewer outliers. Sensible range: 3–8 for small corpora.
+        embed_model:      SentenceTransformer model name override.  If None,
+                          auto-selected: English → all-MiniLM-L6-v2,
+                          others → LaBSE.
+        lang:             ISO 639-1 code ("en", "de", …). Controls stop-word
+                          list, embedding model, and BERTopic language setting.
+
+    Returns:
+        (topic_ids, topic_scores, topic_terms_per_doc, topic_label_map)
+        Topic -1 means the segment is an outlier (not assigned to any cluster).
+    """
+    if embed_model is None:
+        embed_model = _DEFAULT_BERTOPIC_MODEL.get(lang, _DEFAULT_BERTOPIC_MODEL["default"])
+
+    cleaned = [_clean_for_lda(d, lang=lang) for d in docs]
+
+    # Custom vectorizer: use the lighter BERTopic stop list so cluster-
+    # discriminative terms (e.g. "valid"/"gültig", "date"/"datum") remain
+    # visible as labels. min_df=1 ensures rare cluster-unique terms like
+    # "bollo" or "ticino" appear in the label of their specialist cluster.
+    # Use Unicode token_pattern so umlauts are tokenised correctly.
+    stop_words = _get_stop_words(lang, for_bertopic=True)
+    vectorizer = CountVectorizer(
+        stop_words=stop_words,
+        ngram_range=(1, 2),
+        min_df=1,
+        token_pattern=r"(?u)\b[^\W\d_]{3,}\b",
+    )
+
+    embed = SentenceTransformer(embed_model)
+    embeddings = embed.encode(cleaned, show_progress_bar=True, convert_to_numpy=True)
+
+    # UMAP tuned for small corpora:
+    #   n_neighbors=5  — tight local neighbourhood; good for < 100 docs
+    #   n_components=5 — latent dim before HDBSCAN
+    #   min_dist=0.05  — keep similar docs tightly packed
+    umap_model = UMAP(
+        n_neighbors=5,
+        n_components=5,
+        min_dist=0.05,
+        metric="cosine",
+        random_state=42,
+    )
+
+    # HDBSCAN: min_samples=1 makes HDBSCAN less conservative about outliers.
+    hdbscan_model = HDBSCAN(
+        min_cluster_size=min_cluster_size,
+        min_samples=1,
+        metric="euclidean",
+        cluster_selection_method="eom",
+        prediction_data=True,
+    )
+
+    # CRITICAL: use language="multilingual" for non-English text.
+    # When language="english", BERTopic's _preprocess_text applies
+    # re.sub(r"[^A-Za-z0-9 ]+", "", doc) *internally*, stripping umlauts
+    # and all non-ASCII characters before c-TF-IDF term extraction.
+    topic_model = BERTopic(
+        umap_model=umap_model,
+        hdbscan_model=hdbscan_model,
+        vectorizer_model=vectorizer,
+        language="english" if lang == "en" else "multilingual",
+        calculate_probabilities=True,
+        verbose=False,
+        top_n_words=n_top_terms,
+    )
+    topics, probs = topic_model.fit_transform(cleaned, embeddings)
+
+    def _get_terms(t: int) -> str:
+        if t == -1:
+            return "(outlier)"
+        words = topic_model.get_topic(t)
+        return ", ".join(w for w, _ in words if w.strip()) if words else "(no terms)"
+
+    topic_label_map = {t: _get_terms(t) for t in set(topics)}
+    topic_scores = [float(p.max()) if hasattr(p, "max") else 0.0 for p in probs]
+    topic_terms  = [topic_label_map[t] for t in topics]
+
+    return list(topics), topic_scores, topic_terms, topic_label_map
+
+
+# --- usage ---
+# EN:  bt_ids, bt_scores, bt_terms, _ = run_bertopic(docs, lang="en")
+# DE:  bt_ids, bt_scores, bt_terms, _ = run_bertopic(docs, lang="de")
+# FR:  bt_ids, bt_scores, bt_terms, _ = run_bertopic(docs, min_cluster_size=5, lang="fr")
+# IT:  bt_ids, bt_scores, bt_terms, _ = run_bertopic(docs, min_cluster_size=5, lang="it")
+```
+
+Notes:
+- Output columns: `{prefix}_topic_id`, `{prefix}_topic_score`, `{prefix}_topic_terms` per model.
+  When running topic modeling on both source (DE) and target (EN), use a column suffix
+  to keep them separate, e.g. `lda_src_topic_id` vs `lda_topic_id`.
+- **Skip-if-exists pattern**: check `set(df.columns)` before running each model so the
+  script can be re-run incrementally without recomputing already-present columns.
+- **BERTopic outliers** (topic id `-1`): typically 5–15 % of segments on small datasets.
+  Reduce `min_cluster_size` if you want fewer outliers (at the cost of noisier clusters).
+- **Non-English stop words**: spacy models are strongly preferred over NLTK because they
+  cover modal/auxiliary verbs that NLTK misses:  
+  - German: `de_core_news_sm` (543 words) vs NLTK (232 words)  
+  - French: `fr_core_news_sm` (507 words) vs NLTK (157 words)  
+  - Italian: `it_core_news_sm` (624 words) vs NLTK (279 words)  
+  Use `_STOP_WORD_CONFIG` dict to add new languages — just provide the spacy model name,
+  NLTK corpus name, and two extra stop-word frozensets.
+- **LaBSE** (`sentence-transformers/LaBSE`) is an excellent multilingual embedding model
+  covering 109 languages. For this server it is cached at `/scratch/csaba/HF_model_cache`.
+  Used automatically for any non-English language.
+- For large corpora (> 10k docs) prefer LDA or mini-batch HDBSCAN; BERTopic/UMAP can be
+  slow at scale.
+
+````
+
