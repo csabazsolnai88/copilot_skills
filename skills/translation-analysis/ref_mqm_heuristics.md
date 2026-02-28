@@ -1,6 +1,6 @@
 # MQM Heuristic Quality Checks
 
-Five MQM error types detected without an LLM — purely via heuristics and embeddings. Each check writes two columns: a boolean flag (`mqm_{aspect}`) for counting and a details/score column for diagnostics. All checks run unconditionally (no `--termbase` or LLM required) and use the established skip-if-exists pattern.
+Six MQM error types detected without an LLM — purely via heuristics, embeddings, and local NLP tools. Each check writes a boolean flag column (`mqm_{aspect}`) for counting plus a details/score column for diagnostics. All checks use the established skip-if-exists pattern.
 
 | MQM path | Column prefix | Method | LLM required? |
 |---|---|---|---|
@@ -9,6 +9,7 @@ Five MQM error types detected without an LLM — purely via heuristics and embed
 | Accuracy / Mistranslation / MT hallucination | `mqm_hallucination` | Cross-lingual cosine similarity (LaBSE) between src ↔ mt | No (embeddings only) |
 | Accuracy / Addition | `mqm_addition` | Length ratio mt/ref; flag when ratio > threshold | No |
 | Accuracy / Omission | `mqm_omission` | Length ratio mt/ref; flag when ratio < threshold | No |
+| Linguistic conventions / Grammar | `mqm_grammar` | LanguageTool local server — grammar rules (excluding spelling/style) | No (Java server) |
 
 ## Output columns per check
 
@@ -19,6 +20,7 @@ Five MQM error types detected without an LLM — purely via heuristics and embed
 | Hallucination | `mqm_hallucination` (bool) | `mqm_hallucination_score` (float 0–1) | Cosine similarity; lower = more hallucinated |
 | Addition | `mqm_addition` (bool) | `mqm_mt_ref_length_ratio` (float) | Shared ratio column with Omission |
 | Omission | `mqm_omission` (bool) | `mqm_mt_ref_length_ratio` (float) | Shared ratio column with Addition |
+| Grammar | `mqm_grammar` (bool) | `mqm_grammar_details` (JSON list of strings) + `mqm_grammar_count` (int) | Each string: `category/rule: "matched" → "fix" (message)` |
 
 **Cross-flagging is expected.** A hallucinated segment may also be flagged for addition (different content = longer) and entity (entities don't match). A severely truncated segment may flag both omission and entity. When counting error frequencies, filter with exclusions if needed (e.g. `addition AND NOT hallucination AND NOT duplication`).
 
@@ -185,3 +187,88 @@ def detect_addition_omission(
 ```
 
 **Why length-based?** Addition and omission by definition change the amount of content. This heuristic is language-agnostic, needs no embeddings or LLM, and runs instantly. Genuine additions typically have ratios 3–6× while genuine omissions have ratios 0.2–0.4×. Hallucinations and duplications can trigger secondary addition flags (see cross-flagging note above).
+
+---
+
+## Grammar (Linguistic conventions / Grammar)
+
+Uses **LanguageTool** (local Java server via `language_tool_python`) to detect grammar errors in the English MT output. The tool provides 4000+ grammar rules for English spanning subject-verb agreement, tense errors, determiner issues, pronoun case, and more.
+
+**Installation:** `pip install language_tool_python` (downloads ~255 MB Java server on first use). Cache location: `~/.cache/language_tool_python/` — if `/home` is quota-limited, symlink this to a larger filesystem.
+
+**Filter strategy:** Include ALL LanguageTool matches except:
+- `MORFOLOGIK_RULE_*` rule IDs — pure dictionary-based spell-checker (spelling, not grammar)
+- Excluded categories: `REDUNDANCY`, `STYLE`, `CASING`, `TYPOGRAPHY`, `PUNCTUATION`, `MULTITOKEN_SPELLING`, `COMPOUNDING` — these are orthographic/typographic conventions, not grammar in the MQM sense
+
+This keeps grammar-relevant rules from categories: GRAMMAR, COLLOCATIONS, MISC, TYPOS (e.g. CONFUSION_OF_ME_I for pronoun case), NONSTANDARD_PHRASES, CONFUSED_WORDS.
+
+```python
+import language_tool_python
+from typing import Any
+
+_SPELLING_RULE_PREFIXES = ("MORFOLOGIK_RULE",)
+_EXCLUDED_CATEGORIES = frozenset({
+    "REDUNDANCY", "STYLE", "CASING", "TYPOGRAPHY",
+    "PUNCTUATION", "MULTITOKEN_SPELLING", "COMPOUNDING",
+})
+
+
+def _is_grammar_match(match) -> bool:
+    """Return True if a LanguageTool match is a grammar error (not spelling/style)."""
+    for prefix in _SPELLING_RULE_PREFIXES:
+        if match.rule_id.startswith(prefix):
+            return False
+    if match.category in _EXCLUDED_CATEGORIES:
+        return False
+    return True
+
+
+def detect_grammar(text: str, tool: Any) -> tuple[bool, list[str]]:
+    """Detect grammar errors in *text* using LanguageTool.
+
+    Args:
+        text: English text to check.
+        tool: An initialised ``language_tool_python.LanguageTool`` instance
+              (reuse across segments — starting the server is expensive).
+
+    Returns:
+        (flag, details) — flag is True when ≥1 grammar error is found;
+        details is a list of human-readable descriptions.
+    """
+    matches = tool.check(text)
+    details: list[str] = []
+    for m in matches:
+        if _is_grammar_match(m):
+            snippet = m.matched_text or text[m.offset : m.offset + m.error_length]
+            replacement = m.replacements[0] if m.replacements else "?"
+            detail = (
+                f'{m.category}/{m.rule_id}: "{snippet}" → "{replacement}" '
+                f"({m.message})"
+            )
+            details.append(detail)
+    return len(details) > 0, details
+```
+
+**Performance:** ~13 checks/second (single-threaded). For 1515 segments ≈ 2 minutes.
+
+**Tested error types (all detected):**
+- Subject-verb agreement (`AGREEMENT_SENT_START`)
+- Double determiner (`A_MY`)
+- Wrong past participle (`BEEN_PART_AGREEMENT`)
+- Double negative (`DOUBLE_NEGATIVE`)
+- Missing preposition (`LOOK_FORWARD_TO`)
+- a/an error (`EN_A_VS_AN`)
+- Pronoun case (`CONFUSION_OF_ME_I`)
+- Word repetition (`ENGLISH_WORD_REPEAT_RULE`)
+- Nonstandard plural — "informations" (`INFORMATIONS`)
+- Pronoun-verb agreement (`HE_VERB_AGR`)
+- Double comparative (`MOST_COMPARATIVE`)
+- there/their confusion (`THERE_THEIR`)
+- its/it's confusion (`IT_IS`)
+- Modal + wrong verb form (`MD_BASEFORM`)
+
+**Known limitations:**
+- Does **not** catch noun+verb agreement like "The contract have taken" (only pronoun+verb: "He have")
+- Does **not** catch calques/German-influenced word order
+- Missing-comma-before-"which" is not reliably detected (ambiguous restrictive vs non-restrictive)
+- Spelling errors are intentionally excluded (reserved for a separate MQM Spelling check using `MORFOLOGIK_RULE_*`)
