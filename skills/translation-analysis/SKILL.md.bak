@@ -1300,7 +1300,7 @@ def detect_addition_omission(
 
 ## Topic modeling (examples)
 
-Topic modeling helps group segments by domain and surface topic-specific MT issues. The workflow mirrors other analyses: (1) discover topics on a representative corpus, (2) assign per-segment topics and append columns to the output table. Always add **three columns** per topic model: `{prefix}_topic_id`, `{prefix}_topic_score`, `{prefix}_topic_terms`.
+Topic modeling helps group segments by domain and surface topic-specific MT issues. The workflow mirrors other analyses: (1) discover topics on a representative corpus, (2) compute topic diagnostics for segments and append useful columns to the output table. Do not add an aggregated numeric `*_topic_id` metric — topic ids are categorical labels and aggregating them (mean) is not meaningful. Recommended per-model output columns: `{prefix}_topic_score`, `{prefix}_topic_terms` (and report topic distributions or medians if needed).
 
 Two complementary approaches are provided below. Both are tuned for **short TM segments** in a specialised domain (e.g. banking/insurance, automotive) and support **multiple languages** (tested on English, German, French, and Italian). Adapt the stop-word sets and parameters for other domains.
 
@@ -1715,9 +1715,12 @@ def run_bertopic(
 ```
 
 Notes:
-- Output columns: `{prefix}_topic_id`, `{prefix}_topic_score`, `{prefix}_topic_terms` per model.
-  When running topic modeling on both source (DE) and target (EN), use a column suffix
-  to keep them separate, e.g. `lda_src_topic_id` vs `lda_topic_id`.
+- Output columns: `{prefix}_topic_score`, `{prefix}_topic_terms` per model. Do NOT create
+    a categorical `{prefix}_topic_id` column for the purpose of numeric aggregation — topic ids
+    are labels and aggregating them (mean/median) is not meaningful. When you need a summary
+    statistic across the corpus, report topic-score statistics or topic distributions instead.
+    When running topic modeling on both source (DE) and target (EN), keep column name prefixes
+    distinct, e.g. `lda_src_topic_score` vs `lda_topic_score`.
 - **Skip-if-exists pattern**: check `set(df.columns)` before running each model so the
   script can be re-run incrementally without recomputing already-present columns.
 - **BERTopic outliers** (topic id `-1`): typically 5–15 % of segments on small datasets.

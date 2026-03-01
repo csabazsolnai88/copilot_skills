@@ -1,6 +1,6 @@
 # Topic Modeling — LDA & BERTopic
 
-Topic modeling helps group segments by domain and surface topic-specific MT issues. The workflow mirrors other analyses: (1) discover topics on a representative corpus, (2) assign per-segment topics and append columns to the output table. Always add **three columns** per topic model: `{prefix}_topic_id`, `{prefix}_topic_score`, `{prefix}_topic_terms`.
+Topic modeling helps group segments by domain and surface topic-specific MT issues. The workflow mirrors other analyses: (1) discover topics on a representative corpus, (2) compute per-segment topic diagnostics and append useful columns to the output table. Do NOT add categorical topic-id columns for aggregation (e.g. `*_topic_id`) — topic ids are labels and are not meaningful to average or aggregate numerically. Recommended per-model output columns: `{prefix}_topic_score`, `{prefix}_topic_terms` (and report topic distributions, medians, or score statistics when summarizing topics).
 
 Two complementary approaches are provided below. Both are tuned for **short TM segments** in a specialised domain (e.g. banking/insurance, automotive) and support **multiple languages** (tested on English, German, French, and Italian). Adapt the stop-word sets and parameters for other domains.
 
@@ -416,9 +416,13 @@ def run_bertopic(
 
 ## Notes
 
-- Output columns: `{prefix}_topic_id`, `{prefix}_topic_score`, `{prefix}_topic_terms` per model.
-  When running topic modeling on both source (DE) and target (EN), use a column suffix
-  to keep them separate, e.g. `lda_src_topic_id` vs `lda_topic_id`.
+- Output columns: `{prefix}_topic_score`, `{prefix}_topic_terms` per model.
+    When running topic modeling on both source (DE) and target (EN), use a column prefix
+    to keep them separate, e.g. `lda_src_topic_score` vs `lda_topic_score`.
+    Note: Do NOT create categorical `{prefix}_topic_id` columns for aggregation — topic ids
+    are labels and aggregating them (mean/median) is not meaningful. If you need a
+    corpus-level summary, report topic-score statistics or topic distributions instead
+    (e.g. `{prefix}_topic_score_mean`).
 - **Skip-if-exists pattern**: check `set(df.columns)` before running each model so the
   script can be re-run incrementally without recomputing already-present columns.
 - **BERTopic outliers** (topic id `-1`): typically 5–15 % of segments on small datasets.

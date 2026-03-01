@@ -19,6 +19,7 @@ from typing import Any
 import aiohttp
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+
 logger = logging.getLogger(__name__)
 
 
@@ -128,9 +129,7 @@ class VLLMClient:
                                     logger.debug("Extracted JSON from markdown code block")
                                     return result
                                 except (json.JSONDecodeError, ValueError):
-                                    logger.debug(
-                                        f"JSON parsing failed for: {completion[:100]}"
-                                    )
+                                    logger.debug(f"JSON parsing failed for: {completion[:100]}")
                                     raise
                             else:
                                 logger.debug(f"No valid JSON found in: {completion[:100]}")
@@ -151,8 +150,7 @@ class VLLMClient:
             except TimeoutError:
                 wait_time = self.retry_backoff * (2**attempt)
                 logger.warning(
-                    f"Timeout, retrying in {wait_time}s "
-                    f"(attempt {attempt + 1}/{self.max_retries})"
+                    f"Timeout, retrying in {wait_time}s (attempt {attempt + 1}/{self.max_retries})"
                 )
                 await asyncio.sleep(wait_time)
             except Exception as e:
